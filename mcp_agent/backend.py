@@ -11,8 +11,17 @@ from typing import TypedDict, Annotated
 import operator
 import uuid
 
+import asyncio
 import psycopg
+from groq import APIStatusError
 from psycopg.rows import dict_row
+from mcp_agent.mcp_client import (
+    aviation_mcp_call,
+    tavily_mcp_search,
+    extract_destination,
+    weather_mcp_search,
+    forecast_mcp_search,
+)
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.postgres import PostgresSaver
@@ -23,8 +32,6 @@ from langchain_core.messages import (
     SystemMessage,
 )
 from langchain_groq import ChatGroq
-
-import asyncio
 
 
 def get_database_url():
@@ -52,9 +59,42 @@ if not GROQ_API_KEY:
 # =========================
 
 llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    api_key=GROQ_API_KEY
+    model="openai/gpt-oss-120b",
+    api_key=GROQ_API_KEY,
 )
+
+
+def truncate_for_prompt(value: str, max_chars: int = 1600) -> str:
+    text = str(value or "")
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 180] + "\n...[truncated to stay within model limits]"
+
+
+def sanitize_text(value: str) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    return text.encode("ascii", "ignore").decode("ascii")
+
+
+def invoke_llm_with_fallback(system_prompt: str, user_prompt: str, fallback_text: str):
+    prompt = truncate_for_prompt(user_prompt, 1200)
+    for _ in range(3):
+        try:
+            response = llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=prompt),
+            ], max_tokens=300)
+            response.content = sanitize_text(response.content)
+            return response
+        except APIStatusError as exc:
+            if exc.status_code not in {400, 413, 429}:
+                raise
+            if len(prompt) <= 600:
+                break
+            prompt = truncate_for_prompt(prompt, 800)
+    return AIMessage(content=sanitize_text(fallback_text))
 
 
 # =========================
@@ -133,11 +173,11 @@ def flight_agent(state: TravelState):
             HumanMessage(content=prompt)
         ])
 
-        flight_data = response.content
+        flight_data = sanitize_text(response.content)
 
     except Exception as e:
 
-        flight_data = f"Flight information unavailable: {str(e)}"
+        flight_data = sanitize_text(f"Flight information unavailable: {str(e)}")
 
     return {
         "flight_results": flight_data,
@@ -199,27 +239,30 @@ User Query:
 {state['user_query']}
 
 Flight Results:
-{state['flight_results']}
+{truncate_for_prompt(state.get('flight_results', ''), 900)}
 
 Hotel Results:
-{state['hotel_results']}
+{truncate_for_prompt(state.get('hotel_results', ''), 900)}
 
 Weather Results:
-{state['weather_results']}
+{truncate_for_prompt(state.get('weather_results', ''), 700)}
 
 Make the itinerary practical, budget-aware, and easy to follow.
 """
 
-    response = llm.invoke([
-        SystemMessage(content="You are an expert travel planner."),
-        HumanMessage(content=prompt)
-    ])
+    response = invoke_llm_with_fallback(
+        system_prompt="You are an expert travel planner.",
+        user_prompt=prompt,
+        fallback_text="I created a concise travel plan based on the available data, but the external search results were incomplete."
+    )
 
+    response.content = sanitize_text(response.content)
     return {
         "itinerary": response.content,
         "messages": [response],
-        "llm_calls": state.get("llm_calls", 0) + 1
+        "llm_calls": state.get("llm_calls", 0) + 1,
     }
+
 
 def final_agent(state: TravelState):
     final_prompt = f"""
@@ -229,16 +272,16 @@ User Request:
 {state['user_query']}
 
 Flights:
-{state['flight_results']}
+{truncate_for_prompt(state.get('flight_results', ''), 700)}
 
 Hotels:
-{state['hotel_results']}
+{truncate_for_prompt(state.get('hotel_results', ''), 700)}
 
 Weather:
-{state['weather_results']}
+{truncate_for_prompt(state.get('weather_results', ''), 500)}
 
 Itinerary:
-{state['itinerary']}
+{truncate_for_prompt(state.get('itinerary', ''), 700)}
 
 Format the final answer beautifully using these sections:
 
@@ -250,7 +293,6 @@ Format the final answer beautifully using these sections:
 6. Estimated Budget
 7. Final Recommendations
 
-
 Important:
 - Be clear and practical.
 - Mention that live flight API may not provide ticket prices if pricing is unavailable.
@@ -258,14 +300,16 @@ Important:
 - Keep the response useful for real travel planning.
 """
 
-    response = llm.invoke([
-        SystemMessage(content="You are a professional AI travel booking assistant."),
-        HumanMessage(content=final_prompt)
-    ])
+    response = invoke_llm_with_fallback(
+        system_prompt="You are a professional AI travel booking assistant.",
+        user_prompt=final_prompt,
+        fallback_text="I could not generate a full final travel plan because the upstream travel data or model quota was limited. Please retry in a moment."
+    )
 
+    response.content = sanitize_text(response.content)
     return {
         "messages": [response],
-        "llm_calls": state.get("llm_calls", 0) + 1
+        "llm_calls": state.get("llm_calls", 0) + 1,
     }
 
 graph = StateGraph(TravelState)
@@ -322,14 +366,14 @@ def run_travel_agent(user_input: str, thread_id: str | None = None):
         config=config
     )
 
-    final_answer = result["messages"][-1].content
+    final_answer = sanitize_text(result["messages"][-1].content)
 
     return {
         "thread_id": thread_id,
         "answer": final_answer,
-        "flight_results": result.get("flight_results", ""),
-        "hotel_results": result.get("hotel_results", ""),
-        "weather_results": result.get("weather_results", ""),
-        "itinerary": result.get("itinerary", ""),
+        "flight_results": sanitize_text(result.get("flight_results", "")),
+        "hotel_results": sanitize_text(result.get("hotel_results", "")),
+        "weather_results": sanitize_text(result.get("weather_results", "")),
+        "itinerary": sanitize_text(result.get("itinerary", "")),
         "llm_calls": result.get("llm_calls", 0),
     }
