@@ -9,7 +9,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 # TO run the agent without mcp 
-# from backend import run_travel_agent   
+# from backend_simpleapi import run_travel_agent   
 
 # TO run the agent  mcp 
 from mcp_agent.backend import run_travel_agent   
@@ -117,7 +117,7 @@ async def favicon():
 if __name__ == "__main__":
     uvicorn.run(
         "app:app",
-        host="  ",
+        host="0.0.0.0",
         port=8000,
         reload=True
     )
