@@ -7,6 +7,7 @@ port=5432
 
 ***to run the tests.py
 uv run python -m tests.tavily_test
+uv run python -m tests.test
 
 # ✈️ TripMate AI — A Multi-Agent Travel Planner with LangGraph
 
